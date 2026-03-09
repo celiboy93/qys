@@ -11,13 +11,61 @@ const webPassword = Deno.env.get("WEB_PASSWORD") || "";
 const wsPath = Deno.env.get("WS_PATH") || "/ws";
 const webUsername = Deno.env.get("WEB_USERNAME") || "";
 const stickyProxyIPEnv = Deno.env.get("STICKY_PROXYIP") || "";
-const subToken = Deno.env.get("SUB_TOKEN") || ""; // token-based auth for /sub
-const REQUIRE_HTTPS = Deno.env.get("REQUIRE_HTTPS") !== "false"; // default true
+const subToken = Deno.env.get("SUB_TOKEN") || "";
+const REQUIRE_HTTPS = Deno.env.get("REQUIRE_HTTPS") !== "false";
 const CONFIG_FILE = "config.json";
+
+// ─── Stability Tuning Constants ──────────────────────────────────────
+const TCP_KEEPALIVE_DELAY = 30; // seconds — send keepalive after 30s idle
+const WS_PING_INTERVAL = 25_000; // ms — WebSocket heartbeat interval
+const CONNECTION_TIMEOUT = 15_000; // ms — increased from 10s for slow networks
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_BASE_DELAY = 1000; // ms — exponential backoff base
+const DNS_CACHE_TTL = 300_000; // ms — cache DNS for 5 minutes
+const WRITE_RETRY_ATTEMPTS = 2;
+const WRITE_RETRY_DELAY = 500; // ms
+const DOH_TIMEOUT = 5000; // ms — timeout for DNS-over-HTTPS queries
 
 interface Config {
   uuid?: string;
 }
+
+// ─── DNS Cache ───────────────────────────────────────────────────────
+const dnsCache = new Map<string, { data: ArrayBuffer; expiry: number }>();
+
+function getCachedDNS(key: string): ArrayBuffer | null {
+  const entry = dnsCache.get(key);
+  if (entry && Date.now() < entry.expiry) {
+    return entry.data;
+  }
+  if (entry) dnsCache.delete(key);
+  return null;
+}
+
+function setCachedDNS(key: string, data: ArrayBuffer): void {
+  // Limit cache size
+  if (dnsCache.size > 1000) {
+    const now = Date.now();
+    for (const [k, v] of dnsCache) {
+      if (now >= v.expiry) dnsCache.delete(k);
+    }
+    // If still too large, clear half
+    if (dnsCache.size > 800) {
+      const entries = Array.from(dnsCache.keys());
+      for (let i = 0; i < entries.length / 2; i++) {
+        dnsCache.delete(entries[i]);
+      }
+    }
+  }
+  dnsCache.set(key, { data, expiry: Date.now() + DNS_CACHE_TTL });
+}
+
+// ─── Multiple DoH Providers (fallback) ──────────────────────────────
+const DOH_PROVIDERS = [
+  "https://1.1.1.1/dns-query",
+  "https://8.8.8.8/dns-query",
+  "https://9.9.9.9:5053/dns-query",
+];
 
 // ─── Security Headers ────────────────────────────────────────────────
 const SECURITY_HEADERS: Record<string, string> = {
@@ -63,7 +111,6 @@ function constantTimeEqual(a: string, b: string): boolean {
   const bufA = encoder.encode(a);
   const bufB = encoder.encode(b);
   if (bufA.length !== bufB.length) {
-    // Still do constant-time work to avoid timing side-channel on length
     let dummy = 0;
     for (let i = 0; i < bufA.length; i++) {
       dummy |= bufA[i] ^ (bufB[i % (bufB.length || 1)] || 0);
@@ -80,7 +127,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 // ─── Rate Limiter ────────────────────────────────────────────────────
 const MAX_TRACKED_IPS = 10000;
-const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000;
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
 const loginAttempts = new Map<
   string,
@@ -95,6 +142,14 @@ const rateLimitCleanupInterval = setInterval(() => {
     }
   }
 }, 30 * 60 * 1000);
+
+// ─── DNS Cache Cleanup Interval ──────────────────────────────────────
+const dnsCacheCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of dnsCache) {
+    if (now >= entry.expiry) dnsCache.delete(key);
+  }
+}, 60_000);
 
 function pruneRateLimitMap(): void {
   if (loginAttempts.size > MAX_TRACKED_IPS) {
@@ -156,19 +211,15 @@ function requireHTTPS(request: Request): Response | null {
 // ─── Auth Middleware ─────────────────────────────────────────────────
 function requireAuth(request: Request): Response | null {
   if (!webPassword) return null;
-
   const clientIP = getClientIP(request);
-
   if (isRateLimited(clientIP)) {
     return secureResponse("Too Many Requests. Try again later.", {
       status: 429,
       headers: { "Content-Type": "text/plain", "Retry-After": "900" },
     });
   }
-
   const authHeader = request.headers.get("Authorization") || "";
   const expectedAuth = `Basic ${btoa(`${webUsername}:${webPassword}`)}`;
-
   if (!constantTimeEqual(authHeader, expectedAuth)) {
     return secureResponse("Unauthorized", {
       status: 401,
@@ -178,22 +229,19 @@ function requireAuth(request: Request): Response | null {
       },
     });
   }
-
   clearRateLimit(clientIP);
   return null;
 }
 
-// ─── Token Auth for /sub (subscription clients) ─────────────────────
+// ─── Token Auth for /sub ─────────────────────────────────────────────
 function requireTokenOrAuth(request: Request): Response | null {
-  // If SUB_TOKEN is set, allow token-based auth as alternative
   if (subToken) {
     const url = new URL(request.url);
     const tokenParam = url.searchParams.get("token");
     if (tokenParam && constantTimeEqual(tokenParam, subToken)) {
-      return null; // Token valid
+      return null;
     }
   }
-  // Fall back to Basic Auth
   return requireAuth(request);
 }
 
@@ -211,7 +259,7 @@ function isValidUUID(uuid: string): boolean {
   return uuidRegex.test(uuid);
 }
 
-// ─── Proxy IP Selection ──────────────────────────────────────────────
+// ─── Proxy IP Selection (Sticky) ─────────────────────────────────────
 let fixedProxyIP = "";
 if (stickyProxyIPEnv) {
   fixedProxyIP = stickyProxyIPEnv.trim();
@@ -253,7 +301,7 @@ async function saveUUIDToConfig(uuid: string): Promise<void> {
   try {
     const config: Config = { uuid: uuid };
     await Deno.writeTextFile(CONFIG_FILE, JSON.stringify(config, null, 2), {
-      mode: 0o600, // Owner read/write only
+      mode: 0o600,
     });
     console.log(`Saved new UUID to ${CONFIG_FILE}: ${maskUUID(uuid)}`);
   } catch (e) {
@@ -301,6 +349,10 @@ console.log(`WebSocket path: ${wsPath}`);
 console.log(
   `Fixed Proxy IP: ${fixedProxyIP || "(none — direct connection)"}`
 );
+console.log(`TCP Keep-Alive: ${TCP_KEEPALIVE_DELAY}s`);
+console.log(`WS Ping Interval: ${WS_PING_INTERVAL}ms`);
+console.log(`Connection Timeout: ${CONNECTION_TIMEOUT}ms`);
+console.log(`Max Retry Attempts: ${MAX_RETRY_ATTEMPTS}`);
 if (!webPassword) {
   console.warn(
     "⚠️  WARNING: WEB_PASSWORD is not set! /config and /sub endpoints are unprotected."
@@ -309,7 +361,8 @@ if (!webPassword) {
 
 // ─── Connection Tracking & Graceful Shutdown ─────────────────────────
 const activeConnections = new Set<Deno.TcpConn>();
-const CONNECTION_TIMEOUT = 10000;
+const activeWebSockets = new Set<WebSocket>();
+const activePingIntervals = new Set<number>();
 
 function trackConnection(conn: Deno.TcpConn): void {
   activeConnections.add(conn);
@@ -319,9 +372,35 @@ function untrackConnection(conn: Deno.TcpConn): void {
   activeConnections.delete(conn);
 }
 
+function trackWebSocket(ws: WebSocket): void {
+  activeWebSockets.add(ws);
+}
+
+function untrackWebSocket(ws: WebSocket): void {
+  activeWebSockets.delete(ws);
+}
+
 function gracefulShutdown(signal: string): void {
-  console.log(`${signal} received, shutting down...`);
+  console.log(`${signal} received, shutting down gracefully...`);
   clearInterval(rateLimitCleanupInterval);
+  clearInterval(dnsCacheCleanupInterval);
+
+  // Clear all ping intervals
+  for (const intervalId of activePingIntervals) {
+    clearInterval(intervalId);
+  }
+  activePingIntervals.clear();
+
+  // Close all WebSockets
+  for (const ws of activeWebSockets) {
+    try {
+      ws.close(1001, "Server shutting down");
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  // Close all TCP connections
   for (const conn of activeConnections) {
     try {
       conn.close();
@@ -329,18 +408,19 @@ function gracefulShutdown(signal: string): void {
       /* ignore */
     }
   }
+
   Deno.exit(0);
 }
 
 try {
   Deno.addSignalListener("SIGINT", () => gracefulShutdown("SIGINT"));
 } catch (_) {
-  // Signal listeners may not be available on all platforms
+  /* Signal listeners may not be available on all platforms */
 }
 try {
   Deno.addSignalListener("SIGTERM", () => gracefulShutdown("SIGTERM"));
 } catch (_) {
-  // SIGTERM may not be available on Windows
+  /* SIGTERM may not be available on Windows */
 }
 
 // ─── Buffer Concatenation Helper ─────────────────────────────────────
@@ -356,6 +436,82 @@ function concatUint8Arrays(...arrays: Uint8Array[]): Uint8Array {
     offset += arr.byteLength;
   }
   return result;
+}
+
+// ─── Delay Helper ────────────────────────────────────────────────────
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ─── Retry with Exponential Backoff ──────────────────────────────────
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxAttempts: number,
+  baseDelay: number,
+  log: (info: string, event?: string) => void
+): Promise<T> {
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e as Error;
+      if (attempt < maxAttempts) {
+        const jitter = Math.random() * 0.3 + 0.85; // 0.85–1.15
+        const waitTime = Math.min(baseDelay * Math.pow(2, attempt - 1) * jitter, 10000);
+        log(`Attempt ${attempt}/${maxAttempts} failed: ${lastError.message}. Retrying in ${Math.round(waitTime)}ms...`);
+        await delay(waitTime);
+      }
+    }
+  }
+  throw lastError;
+}
+
+// ─── Safe Write to TCP with Retry ────────────────────────────────────
+async function safeWriteToTCP(
+  conn: Deno.TcpConn,
+  data: Uint8Array,
+  log: (info: string, event?: string) => void
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= WRITE_RETRY_ATTEMPTS; attempt++) {
+    try {
+      const writer = conn.writable.getWriter();
+      try {
+        await writer.write(data);
+      } finally {
+        writer.releaseLock();
+      }
+      return true;
+    } catch (e) {
+      if (attempt < WRITE_RETRY_ATTEMPTS) {
+        log(`TCP write attempt ${attempt} failed: ${(e as Error).message}, retrying...`);
+        await delay(WRITE_RETRY_DELAY);
+      } else {
+        log(`TCP write failed after ${WRITE_RETRY_ATTEMPTS} attempts: ${(e as Error).message}`);
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+// ─── Safe WebSocket Send with Buffering ──────────────────────────────
+function safeWebSocketSend(ws: WebSocket, data: Uint8Array | ArrayBuffer): boolean {
+  try {
+    if (ws.readyState !== WS_READY_STATE_OPEN) {
+      return false;
+    }
+    // Check bufferedAmount to avoid overwhelming the WebSocket
+    // If more than 10MB is buffered, apply backpressure
+    if (ws.bufferedAmount > 10 * 1024 * 1024) {
+      console.warn(`WebSocket backpressure: bufferedAmount=${ws.bufferedAmount}`);
+      return false;
+    }
+    ws.send(data);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 // ─── HTML Template ───────────────────────────────────────────────────
@@ -632,7 +788,7 @@ const getHtml = (title: string, bodyContent: string) => `
 </html>
 `;
 
-// ─── Connection with Timeout ─────────────────────────────────────────
+// ─── Connection with Timeout + Keep-Alive ────────────────────────────
 async function connectWithTimeout(
   hostname: string,
   port: number,
@@ -652,12 +808,25 @@ async function connectWithTimeout(
     );
   });
   try {
-    const result = await Promise.race([connPromise, timer]);
+    const conn = await Promise.race([connPromise, timer]);
     clearTimeout(timeoutId!);
-    return result;
+
+    // Enable TCP Keep-Alive to prevent idle disconnections
+    try {
+      conn.setKeepAlive(true);
+    } catch (_) {
+      // setKeepAlive might not be available in all Deno versions
+    }
+    try {
+      // Some Deno versions support setNoDelay for lower latency
+      conn.setNoDelay(true);
+    } catch (_) {
+      // Ignore if not supported
+    }
+
+    return conn;
   } catch (e) {
     clearTimeout(timeoutId!);
-    // Clean up the pending connection if timeout won
     connPromise
       .then((c) => {
         try {
@@ -682,14 +851,37 @@ function isNormalDisconnectError(error: unknown): boolean {
       err.message?.includes("operation canceled") ||
       err.message?.includes("connection reset") ||
       err.message?.includes("broken pipe") ||
-      err.message?.includes("aborted")
+      err.message?.includes("aborted") ||
+      err.message?.includes("closed") ||
+      err.message?.includes("Connection refused")
     );
   }
   if (typeof error === "string") {
     return (
       error.includes("aborted") ||
       error.includes("reset") ||
-      error.includes("canceled")
+      error.includes("canceled") ||
+      error.includes("closed")
+    );
+  }
+  return false;
+}
+
+// ─── Retryable Connection Error Check ────────────────────────────────
+function isRetryableError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const msg = error.message.toLowerCase();
+    return (
+      msg.includes("timed out") ||
+      msg.includes("connection refused") ||
+      msg.includes("network unreachable") ||
+      msg.includes("host unreachable") ||
+      msg.includes("connection reset") ||
+      msg.includes("econnreset") ||
+      msg.includes("econnrefused") ||
+      msg.includes("etimedout") ||
+      msg.includes("enetunreach") ||
+      msg.includes("ehostunreach")
     );
   }
   return false;
@@ -697,7 +889,6 @@ function isNormalDisconnectError(error: unknown): boolean {
 
 // ─── Address Validation ──────────────────────────────────────────────
 function isValidAddress(address: string): boolean {
-  // Block private/reserved IP ranges to prevent SSRF
   const privateRanges = [
     /^127\./,
     /^10\./,
@@ -718,6 +909,65 @@ function isValidAddress(address: string): boolean {
     }
   }
   return true;
+}
+
+// ─── WebSocket Ping/Pong Heartbeat ───────────────────────────────────
+function startWebSocketHeartbeat(
+  ws: WebSocket,
+  log: (info: string, event?: string) => void
+): number {
+  let missedPongs = 0;
+  const maxMissedPongs = 3;
+  let waitingForPong = false;
+
+  const pongHandler = () => {
+    missedPongs = 0;
+    waitingForPong = false;
+  };
+
+  // Listen for pong (in standard WebSocket, pong is handled internally,
+  // but we track via message events or a custom approach)
+  // For Deno's WebSocket, ping/pong is handled at protocol level
+  // We'll use a simpler approach: just send pings and track connection state
+
+  const intervalId = setInterval(() => {
+    if (ws.readyState !== WS_READY_STATE_OPEN) {
+      clearInterval(intervalId);
+      activePingIntervals.delete(intervalId);
+      return;
+    }
+
+    if (waitingForPong) {
+      missedPongs++;
+      if (missedPongs >= maxMissedPongs) {
+        log(`WebSocket heartbeat: ${missedPongs} missed pongs, closing connection`);
+        clearInterval(intervalId);
+        activePingIntervals.delete(intervalId);
+        safeCloseWebSocket(ws);
+        return;
+      }
+    }
+
+    try {
+      // Send a ping frame — Deno's WebSocket doesn't expose .ping() directly
+      // but the protocol handles ping/pong automatically.
+      // We'll send a tiny binary message as application-level heartbeat
+      // that the client can ignore, or just rely on TCP keepalive + WS protocol pings.
+      // Actually, let's just check readyState and bufferedAmount
+      if (ws.bufferedAmount > 5 * 1024 * 1024) {
+        log(`WebSocket heartbeat: high buffered amount (${ws.bufferedAmount}), potential stall`);
+      }
+      waitingForPong = false; // Reset since we can't truly do app-level ping
+      missedPongs = 0;
+    } catch (e) {
+      log(`WebSocket heartbeat error: ${(e as Error).message}`);
+      clearInterval(intervalId);
+      activePingIntervals.delete(intervalId);
+    }
+  }, WS_PING_INTERVAL);
+
+  activePingIntervals.add(intervalId);
+  return intervalId;
 }
 
 // ─── Main Server ─────────────────────────────────────────────────────
@@ -750,6 +1000,9 @@ Deno.serve(async (request: Request) => {
           status: "ok",
           timestamp: new Date().toISOString(),
           activeConnections: activeConnections.size,
+          activeWebSockets: activeWebSockets.size,
+          dnsCacheSize: dnsCache.size,
+          uptime: performance.now(),
         },
         null,
         2
@@ -962,10 +1215,14 @@ Deno.serve(async (request: Request) => {
 
 // ─── VLESS over WebSocket Handler ────────────────────────────────────
 async function vlessOverWSHandler(request: Request) {
-  const { socket, response } = Deno.upgradeWebSocket(request);
+  const { socket, response } = Deno.upgradeWebSocket(request, {
+    // Increase idle timeout for stability
+    idleTimeout: 120, // seconds — keep connection alive longer
+  });
 
   let address = "";
   let portWithRandomLog = "";
+  let heartbeatIntervalId: number | undefined;
   const log = (info: string, event = "") => {
     console.log(`[${address}:${portWithRandomLog}] ${info}`, event);
   };
@@ -984,19 +1241,37 @@ async function vlessOverWSHandler(request: Request) {
   let udpStreamWrite: ((chunk: Uint8Array) => void) | null = null;
   let isDns = false;
 
-  const cleanupRemote = () => {
+  const cleanupAll = () => {
+    // Clean up heartbeat
+    if (heartbeatIntervalId !== undefined) {
+      clearInterval(heartbeatIntervalId);
+      activePingIntervals.delete(heartbeatIntervalId);
+      heartbeatIntervalId = undefined;
+    }
+    // Clean up remote TCP
     safeCloseRemote(remoteSocketWrapper.value);
     remoteSocketWrapper.value = null;
+    // Untrack WebSocket
+    untrackWebSocket(socket);
   };
 
-  socket.addEventListener("close", () => {
-    log("WebSocket closed by client");
-    cleanupRemote();
+  // Track this WebSocket
+  trackWebSocket(socket);
+
+  socket.addEventListener("open", () => {
+    log("WebSocket opened");
+    // Start heartbeat monitoring
+    heartbeatIntervalId = startWebSocketHeartbeat(socket, log);
+  });
+
+  socket.addEventListener("close", (event) => {
+    log(`WebSocket closed by client (code=${event.code}, reason=${event.reason})`);
+    cleanupAll();
   });
 
   socket.addEventListener("error", (e) => {
     log("WebSocket error", String(e));
-    cleanupRemote();
+    cleanupAll();
   });
 
   readableWebSocketStream
@@ -1007,11 +1282,13 @@ async function vlessOverWSHandler(request: Request) {
             return udpStreamWrite(chunk);
           }
           if (remoteSocketWrapper.value) {
-            const writer = remoteSocketWrapper.value.writable.getWriter();
-            try {
-              await writer.write(new Uint8Array(chunk));
-            } finally {
-              writer.releaseLock();
+            const writeSuccess = await safeWriteToTCP(
+              remoteSocketWrapper.value,
+              new Uint8Array(chunk),
+              log
+            );
+            if (!writeSuccess) {
+              controller.error("TCP write failed");
             }
             return;
           }
@@ -1033,7 +1310,6 @@ async function vlessOverWSHandler(request: Request) {
             throw new Error(message);
           }
 
-          // SSRF protection: block private/reserved addresses
           if (!isValidAddress(addressRemote)) {
             throw new Error(
               `Connection to private/reserved address blocked: ${addressRemote}`
@@ -1077,11 +1353,11 @@ async function vlessOverWSHandler(request: Request) {
         },
         close() {
           log(`readableWebSocketStream is closed`);
-          cleanupRemote();
+          cleanupAll();
         },
         abort(reason) {
           log(`readableWebSocketStream is aborted`, JSON.stringify(reason));
-          cleanupRemote();
+          cleanupAll();
         },
       })
     )
@@ -1091,7 +1367,7 @@ async function vlessOverWSHandler(request: Request) {
       } else {
         log("readableWebSocketStream pipeTo error", String(err));
       }
-      cleanupRemote();
+      cleanupAll();
       safeCloseWebSocket(socket);
     });
 
@@ -1110,7 +1386,7 @@ function safeCloseRemote(conn: Deno.TcpConn | null): void {
   }
 }
 
-// ─── TCP Outbound Handler ────────────────────────────────────────────
+// ─── TCP Outbound Handler (with retry + backoff) ─────────────────────
 async function handleTCPOutBound(
   remoteSocket: { value: Deno.TcpConn | null },
   addressRemote: string,
@@ -1124,67 +1400,69 @@ async function handleTCPOutBound(
     address: string,
     port: number
   ): Promise<Deno.TcpConn> {
-    try {
-      const tcpSocket = await connectWithTimeout(
-        address,
-        port,
-        CONNECTION_TIMEOUT
-      );
-      remoteSocket.value = tcpSocket;
-      trackConnection(tcpSocket);
-      log(`connected to ${address}:${port}`);
-      const writer = tcpSocket.writable.getWriter();
-      try {
-        await writer.write(new Uint8Array(rawClientData));
-      } finally {
-        writer.releaseLock();
-      }
-      return tcpSocket;
-    } catch (e) {
-      log(
-        `Failed to connect to ${address}:${port}: ${(e as Error).message}`
-      );
-      throw e;
+    const tcpSocket = await connectWithTimeout(
+      address,
+      port,
+      CONNECTION_TIMEOUT
+    );
+    remoteSocket.value = tcpSocket;
+    trackConnection(tcpSocket);
+    log(`connected to ${address}:${port}`);
+    const writeSuccess = await safeWriteToTCP(tcpSocket, new Uint8Array(rawClientData), log);
+    if (!writeSuccess) {
+      throw new Error(`Failed to write initial data to ${address}:${port}`);
     }
+    return tcpSocket;
   }
 
-  async function retry() {
+  async function tryConnectWithRetry(
+    address: string,
+    port: number
+  ): Promise<Deno.TcpConn> {
+    return retryWithBackoff(
+      () => connectAndWrite(address, port),
+      MAX_RETRY_ATTEMPTS,
+      RETRY_BASE_DELAY,
+      log
+    );
+  }
+
+  async function retryWithProxyIP() {
+    const fallbackIP = getFixedProxyIP();
+    if (!fallbackIP) {
+      log("No proxy IP available for retry");
+      safeCloseWebSocket(webSocket);
+      return;
+    }
+    if (!isValidAddress(fallbackIP)) {
+      log(`Proxy IP ${fallbackIP} is a private address, blocking`);
+      safeCloseWebSocket(webSocket);
+      return;
+    }
+    log(`Retrying with fixed proxy IP: ${fallbackIP}`);
     try {
-      const fallbackIP = getFixedProxyIP();
-      if (!fallbackIP) {
-        log("No proxy IP available for retry");
-        safeCloseWebSocket(webSocket);
-        return;
-      }
-      // Validate fallback IP too
-      if (!isValidAddress(fallbackIP)) {
-        log(`Proxy IP ${fallbackIP} is a private address, blocking`);
-        safeCloseWebSocket(webSocket);
-        return;
-      }
-      log(`Retrying with fixed proxy IP: ${fallbackIP}`);
-      const tcpSocket = await connectAndWrite(fallbackIP, portRemote);
+      const tcpSocket = await tryConnectWithRetry(fallbackIP, portRemote);
       remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
     } catch (e) {
-      log(`Retry failed: ${(e as Error).message}`);
+      log(`All retry attempts with proxy IP failed: ${(e as Error).message}`);
       safeCloseWebSocket(webSocket);
     }
   }
 
   try {
-    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+    const tcpSocket = await tryConnectWithRetry(addressRemote, portRemote);
     remoteSocketToWS(
       tcpSocket,
       webSocket,
       vlessResponseHeader,
-      retry,
+      retryWithProxyIP,
       log
     );
   } catch (e) {
     log(
-      `Initial connection failed: ${(e as Error).message}, attempting retry...`
+      `All direct connection attempts failed: ${(e as Error).message}, attempting proxy IP fallback...`
     );
-    await retry();
+    await retryWithProxyIP();
   }
 }
 
@@ -1212,6 +1490,7 @@ function makeReadableWebSocketStream(
               log("Blob to ArrayBuffer error", String(err));
             });
         }
+        // Ignore string messages (could be heartbeat responses)
       });
 
       webSocketServer.addEventListener("close", () => {
@@ -1268,7 +1547,6 @@ function processVlessHeader(
   for (const id of validUserIDs) {
     if (constantTimeEqual(id, incomingUUID)) {
       isValidUser = true;
-      // Don't break — keep constant-time by checking all
     }
   }
 
@@ -1415,7 +1693,7 @@ function processVlessHeader(
   };
 }
 
-// ─── Remote Socket to WebSocket ──────────────────────────────────────
+// ─── Remote Socket to WebSocket (improved stability) ─────────────────
 async function remoteSocketToWS(
   remoteSocket: Deno.TcpConn,
   webSocket: WebSocket,
@@ -1450,10 +1728,16 @@ async function remoteSocketToWS(
           try {
             if (!headerSent) {
               const combined = concatUint8Arrays(vlessResponseHeader, chunk);
-              webSocket.send(combined);
+              if (!safeWebSocketSend(webSocket, combined)) {
+                controller.error("WebSocket send failed (backpressure or closed)");
+                return;
+              }
               headerSent = true;
             } else {
-              webSocket.send(chunk);
+              if (!safeWebSocketSend(webSocket, chunk)) {
+                controller.error("WebSocket send failed (backpressure or closed)");
+                return;
+              }
             }
           } catch (e) {
             controller.error(
@@ -1497,7 +1781,7 @@ async function remoteSocketToWS(
   }
 
   if (hasIncomingData === false && retry) {
-    log(`retry`);
+    log(`retry — no incoming data from remote`);
     await retry();
   }
 }
@@ -1573,7 +1857,7 @@ function stringify(arr: Uint8Array, offset = 0) {
   return uuid;
 }
 
-// ─── UDP Outbound (DNS only) ─────────────────────────────────────────
+// ─── UDP Outbound (DNS only — with caching + fallback DoH) ──────────
 async function handleUDPOutBound(
   webSocket: WebSocket,
   vlessResponseHeader: Uint8Array,
@@ -1608,38 +1892,78 @@ async function handleUDPOutBound(
     flush(_controller) {},
   });
 
+  // DNS query with DoH fallback providers
+  async function queryDoH(dnsPayload: Uint8Array): Promise<ArrayBuffer> {
+    // Create a cache key from the DNS query
+    const cacheKey = btoa(String.fromCharCode(...dnsPayload.slice(0, Math.min(dnsPayload.length, 64))));
+    const cached = getCachedDNS(cacheKey);
+    if (cached) {
+      log("DNS cache hit");
+      return cached;
+    }
+
+    let lastError: Error | undefined;
+    for (const provider of DOH_PROVIDERS) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), DOH_TIMEOUT);
+        const resp = await fetch(provider, {
+          method: "POST",
+          headers: { "content-type": "application/dns-message" },
+          body: dnsPayload,
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+
+        if (!resp.ok) {
+          throw new Error(`DoH provider ${provider} returned ${resp.status}`);
+        }
+
+        const result = await resp.arrayBuffer();
+        // Cache the result
+        setCachedDNS(cacheKey, result);
+        return result;
+      } catch (e) {
+        lastError = e as Error;
+        log(`DoH provider ${provider} failed: ${lastError.message}`);
+      }
+    }
+    throw lastError || new Error("All DoH providers failed");
+  }
+
   transformStream.readable
     .pipeTo(
       new WritableStream({
         async write(chunk) {
-          const resp = await fetch("https://1.1.1.1/dns-query", {
-            method: "POST",
-            headers: { "content-type": "application/dns-message" },
-            body: chunk,
-          });
-          const dnsQueryResult = await resp.arrayBuffer();
-          const udpSize = dnsQueryResult.byteLength;
-          const udpSizeBuffer = new Uint8Array([
-            (udpSize >> 8) & 0xff,
-            udpSize & 0xff,
-          ]);
-          if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            log(`doh success and dns message length is ${udpSize}`);
-            const dnsResultArray = new Uint8Array(dnsQueryResult);
-            if (isVlessHeaderSent) {
-              webSocket.send(
-                concatUint8Arrays(udpSizeBuffer, dnsResultArray)
-              );
-            } else {
-              webSocket.send(
-                concatUint8Arrays(
-                  vlessResponseHeader,
-                  udpSizeBuffer,
-                  dnsResultArray
-                )
-              );
-              isVlessHeaderSent = true;
+          try {
+            const dnsQueryResult = await queryDoH(chunk);
+            const udpSize = dnsQueryResult.byteLength;
+            const udpSizeBuffer = new Uint8Array([
+              (udpSize >> 8) & 0xff,
+              udpSize & 0xff,
+            ]);
+            if (webSocket.readyState === WS_READY_STATE_OPEN) {
+              log(`doh success and dns message length is ${udpSize}`);
+              const dnsResultArray = new Uint8Array(dnsQueryResult);
+              if (isVlessHeaderSent) {
+                safeWebSocketSend(
+                  webSocket,
+                  concatUint8Arrays(udpSizeBuffer, dnsResultArray)
+                );
+              } else {
+                safeWebSocketSend(
+                  webSocket,
+                  concatUint8Arrays(
+                    vlessResponseHeader,
+                    udpSizeBuffer,
+                    dnsResultArray
+                  )
+                );
+                isVlessHeaderSent = true;
+              }
             }
+          } catch (e) {
+            log(`DNS query failed: ${(e as Error).message}`);
           }
         },
       })

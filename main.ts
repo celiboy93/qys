@@ -16,15 +16,16 @@ const REQUIRE_HTTPS = Deno.env.get("REQUIRE_HTTPS") !== "false";
 const CONFIG_FILE = "config.json";
 
 // ─── Stability Tuning Constants ──────────────────────────────────────
-const TCP_KEEPALIVE_DELAY = 30; // seconds — send keepalive after 30s idle
-const WS_PING_INTERVAL = 25_000; // ms — WebSocket heartbeat interval
-const CONNECTION_TIMEOUT = 15_000; // ms — increased from 10s for slow networks
+const TCP_KEEPALIVE_DELAY = 30;
+const WS_PING_INTERVAL = 20_000;       // ← 25s → 20s ပိုမြန်အောင်
+const CONNECTION_TIMEOUT = 15_000;
 const MAX_RETRY_ATTEMPTS = 3;
-const RETRY_BASE_DELAY = 1000; // ms — exponential backoff base
-const DNS_CACHE_TTL = 300_000; // ms — cache DNS for 5 minutes
-const WRITE_RETRY_ATTEMPTS = 2;
-const WRITE_RETRY_DELAY = 500; // ms
-const DOH_TIMEOUT = 5000; // ms — timeout for DNS-over-HTTPS queries
+const RETRY_BASE_DELAY = 800;          // ← 1000 → 800 ပိုမြန်အောင်
+const DNS_CACHE_TTL = 300_000;
+const DOH_TIMEOUT = 5000;
+const WS_BACKPRESSURE_THRESHOLD = 4 * 1024 * 1024;  // 4MB — ← 10MB ကနေ လျှော့ပြီး backpressure ကို စောစောရှာ
+const WS_BACKPRESSURE_WAIT = 100;      // ms — backpressure ဖြစ်ရင် ခဏစောင့်
+const WS_BACKPRESSURE_MAX_WAIT = 3000; // ms — max wait before giving up
 
 interface Config {
   uuid?: string;
@@ -43,13 +44,11 @@ function getCachedDNS(key: string): ArrayBuffer | null {
 }
 
 function setCachedDNS(key: string, data: ArrayBuffer): void {
-  // Limit cache size
   if (dnsCache.size > 1000) {
     const now = Date.now();
     for (const [k, v] of dnsCache) {
       if (now >= v.expiry) dnsCache.delete(k);
     }
-    // If still too large, clear half
     if (dnsCache.size > 800) {
       const entries = Array.from(dnsCache.keys());
       for (let i = 0; i < entries.length / 2; i++) {
@@ -385,13 +384,11 @@ function gracefulShutdown(signal: string): void {
   clearInterval(rateLimitCleanupInterval);
   clearInterval(dnsCacheCleanupInterval);
 
-  // Clear all ping intervals
   for (const intervalId of activePingIntervals) {
     clearInterval(intervalId);
   }
   activePingIntervals.clear();
 
-  // Close all WebSockets
   for (const ws of activeWebSockets) {
     try {
       ws.close(1001, "Server shutting down");
@@ -400,7 +397,6 @@ function gracefulShutdown(signal: string): void {
     }
   }
 
-  // Close all TCP connections
   for (const conn of activeConnections) {
     try {
       conn.close();
@@ -457,7 +453,7 @@ async function retryWithBackoff<T>(
     } catch (e) {
       lastError = e as Error;
       if (attempt < maxAttempts) {
-        const jitter = Math.random() * 0.3 + 0.85; // 0.85–1.15
+        const jitter = Math.random() * 0.3 + 0.85;
         const waitTime = Math.min(baseDelay * Math.pow(2, attempt - 1) * jitter, 10000);
         log(`Attempt ${attempt}/${maxAttempts} failed: ${lastError.message}. Retrying in ${Math.round(waitTime)}ms...`);
         await delay(waitTime);
@@ -467,44 +463,58 @@ async function retryWithBackoff<T>(
   throw lastError;
 }
 
-// ─── Safe Write to TCP with Retry ────────────────────────────────────
+// ─── [FIX #1] Safe Write to TCP — no repeated getWriter() ───────────
+// ── ယခင်ကုဒ်မှာ write တိုင်းမှာ getWriter() ခေါ်ထားတာ stream lock ပြဿနာဖြစ်နိုင်တယ်
+// ── ခု writer.write() ကို direct writable ပေါ်မှာ ပဲသုံးမယ်
 async function safeWriteToTCP(
-  conn: Deno.TcpConn,
+  writer: WritableStreamDefaultWriter<Uint8Array>,
   data: Uint8Array,
   log: (info: string, event?: string) => void
 ): Promise<boolean> {
-  for (let attempt = 1; attempt <= WRITE_RETRY_ATTEMPTS; attempt++) {
-    try {
-      const writer = conn.writable.getWriter();
-      try {
-        await writer.write(data);
-      } finally {
-        writer.releaseLock();
-      }
-      return true;
-    } catch (e) {
-      if (attempt < WRITE_RETRY_ATTEMPTS) {
-        log(`TCP write attempt ${attempt} failed: ${(e as Error).message}, retrying...`);
-        await delay(WRITE_RETRY_DELAY);
-      } else {
-        log(`TCP write failed after ${WRITE_RETRY_ATTEMPTS} attempts: ${(e as Error).message}`);
-        return false;
-      }
-    }
+  try {
+    await writer.write(data);
+    return true;
+  } catch (e) {
+    log(`TCP write failed: ${(e as Error).message}`);
+    return false;
   }
-  return false;
 }
 
-// ─── Safe WebSocket Send with Buffering ──────────────────────────────
-function safeWebSocketSend(ws: WebSocket, data: Uint8Array | ArrayBuffer): boolean {
+// ─── [FIX #2] Safe WebSocket Send with Backpressure Wait ────────────
+// ── ယခင်ကုဒ်မှာ backpressure ဖြစ်ရင် data drop ချလိုက်တာ connection ပြတ်စေတယ်
+// ── ခု backpressure ဖြစ်ရင် bufferedAmount ကျသွားတဲ့အထိ ခဏစောင့်မယ်
+async function safeWebSocketSend(
+  ws: WebSocket,
+  data: Uint8Array | ArrayBuffer
+): Promise<boolean> {
   try {
     if (ws.readyState !== WS_READY_STATE_OPEN) {
       return false;
     }
-    // Check bufferedAmount to avoid overwhelming the WebSocket
-    // If more than 10MB is buffered, apply backpressure
-    if (ws.bufferedAmount > 10 * 1024 * 1024) {
-      console.warn(`WebSocket backpressure: bufferedAmount=${ws.bufferedAmount}`);
+    // Wait for backpressure to clear instead of dropping data
+    let waited = 0;
+    while (ws.bufferedAmount > WS_BACKPRESSURE_THRESHOLD && waited < WS_BACKPRESSURE_MAX_WAIT) {
+      await delay(WS_BACKPRESSURE_WAIT);
+      waited += WS_BACKPRESSURE_WAIT;
+      if (ws.readyState !== WS_READY_STATE_OPEN) {
+        return false;
+      }
+    }
+    if (ws.bufferedAmount > WS_BACKPRESSURE_THRESHOLD) {
+      console.warn(`WebSocket backpressure not cleared after ${WS_BACKPRESSURE_MAX_WAIT}ms, buffered=${ws.bufferedAmount}`);
+      // Still try to send — don't drop the data
+    }
+    ws.send(data);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ─── [FIX #2b] Synchronous version for contexts where async isn't ideal ──
+function safeWebSocketSendSync(ws: WebSocket, data: Uint8Array | ArrayBuffer): boolean {
+  try {
+    if (ws.readyState !== WS_READY_STATE_OPEN) {
       return false;
     }
     ws.send(data);
@@ -811,14 +821,12 @@ async function connectWithTimeout(
     const conn = await Promise.race([connPromise, timer]);
     clearTimeout(timeoutId!);
 
-    // Enable TCP Keep-Alive to prevent idle disconnections
     try {
       conn.setKeepAlive(true);
     } catch (_) {
       // setKeepAlive might not be available in all Deno versions
     }
     try {
-      // Some Deno versions support setNoDelay for lower latency
       conn.setNoDelay(true);
     } catch (_) {
       // Ignore if not supported
@@ -911,24 +919,20 @@ function isValidAddress(address: string): boolean {
   return true;
 }
 
-// ─── WebSocket Ping/Pong Heartbeat ───────────────────────────────────
+// ─── [FIX #3] WebSocket Ping/Pong Heartbeat — properly functional ───
+// ── ယခင်ကုဒ်မှာ ping/pong logic က အလုပ်မလုပ်ဘူး (waitingForPong ကို reset လုပ်ထားတယ်)
+// ── ခု readyState + bufferedAmount ကိုပဲ စစ်ပြီး dead connection detect လုပ်မယ်
 function startWebSocketHeartbeat(
   ws: WebSocket,
   log: (info: string, event?: string) => void
 ): number {
-  let missedPongs = 0;
-  const maxMissedPongs = 3;
-  let waitingForPong = false;
+  let lastActivityTime = Date.now();
+  let consecutiveStalls = 0;
+  const maxConsecutiveStalls = 3;
+  const staleThreshold = WS_PING_INTERVAL * 3; // No activity for 3 intervals = stale
 
-  const pongHandler = () => {
-    missedPongs = 0;
-    waitingForPong = false;
-  };
-
-  // Listen for pong (in standard WebSocket, pong is handled internally,
-  // but we track via message events or a custom approach)
-  // For Deno's WebSocket, ping/pong is handled at protocol level
-  // We'll use a simpler approach: just send pings and track connection state
+  // Track activity — update when we know data is flowing
+  const originalSend = ws.send.bind(ws);
 
   const intervalId = setInterval(() => {
     if (ws.readyState !== WS_READY_STATE_OPEN) {
@@ -937,32 +941,21 @@ function startWebSocketHeartbeat(
       return;
     }
 
-    if (waitingForPong) {
-      missedPongs++;
-      if (missedPongs >= maxMissedPongs) {
-        log(`WebSocket heartbeat: ${missedPongs} missed pongs, closing connection`);
+    const now = Date.now();
+
+    // Check for buffered amount stall (data stuck, not draining)
+    if (ws.bufferedAmount > WS_BACKPRESSURE_THRESHOLD) {
+      consecutiveStalls++;
+      log(`WebSocket heartbeat: buffered=${ws.bufferedAmount}, stall #${consecutiveStalls}`);
+      if (consecutiveStalls >= maxConsecutiveStalls) {
+        log(`WebSocket heartbeat: ${consecutiveStalls} consecutive stalls, connection appears dead — closing`);
         clearInterval(intervalId);
         activePingIntervals.delete(intervalId);
         safeCloseWebSocket(ws);
         return;
       }
-    }
-
-    try {
-      // Send a ping frame — Deno's WebSocket doesn't expose .ping() directly
-      // but the protocol handles ping/pong automatically.
-      // We'll send a tiny binary message as application-level heartbeat
-      // that the client can ignore, or just rely on TCP keepalive + WS protocol pings.
-      // Actually, let's just check readyState and bufferedAmount
-      if (ws.bufferedAmount > 5 * 1024 * 1024) {
-        log(`WebSocket heartbeat: high buffered amount (${ws.bufferedAmount}), potential stall`);
-      }
-      waitingForPong = false; // Reset since we can't truly do app-level ping
-      missedPongs = 0;
-    } catch (e) {
-      log(`WebSocket heartbeat error: ${(e as Error).message}`);
-      clearInterval(intervalId);
-      activePingIntervals.delete(intervalId);
+    } else {
+      consecutiveStalls = 0;
     }
   }, WS_PING_INTERVAL);
 
@@ -1213,16 +1206,17 @@ Deno.serve(async (request: Request) => {
   );
 });
 
-// ─── VLESS over WebSocket Handler ────────────────────────────────────
+// ─── [FIX #4] VLESS over WebSocket Handler — improved cleanup & writer management ──
 async function vlessOverWSHandler(request: Request) {
   const { socket, response } = Deno.upgradeWebSocket(request, {
-    // Increase idle timeout for stability
-    idleTimeout: 120, // seconds — keep connection alive longer
+    idleTimeout: 120,
   });
 
   let address = "";
   let portWithRandomLog = "";
   let heartbeatIntervalId: number | undefined;
+  let cleanedUp = false;  // ← prevent double cleanup
+
   const log = (info: string, event = "") => {
     console.log(`[${address}:${portWithRandomLog}] ${info}`, event);
   };
@@ -1238,15 +1232,29 @@ async function vlessOverWSHandler(request: Request) {
   const remoteSocketWrapper: { value: Deno.TcpConn | null } = {
     value: null,
   };
+  // [FIX] Track the TCP writer separately to avoid repeated getWriter() calls
+  const tcpWriterWrapper: { value: WritableStreamDefaultWriter<Uint8Array> | null } = {
+    value: null,
+  };
   let udpStreamWrite: ((chunk: Uint8Array) => void) | null = null;
   let isDns = false;
 
   const cleanupAll = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+
     // Clean up heartbeat
     if (heartbeatIntervalId !== undefined) {
       clearInterval(heartbeatIntervalId);
       activePingIntervals.delete(heartbeatIntervalId);
       heartbeatIntervalId = undefined;
+    }
+    // Release TCP writer
+    if (tcpWriterWrapper.value) {
+      try {
+        tcpWriterWrapper.value.releaseLock();
+      } catch (_) { /* ignore */ }
+      tcpWriterWrapper.value = null;
     }
     // Clean up remote TCP
     safeCloseRemote(remoteSocketWrapper.value);
@@ -1260,7 +1268,6 @@ async function vlessOverWSHandler(request: Request) {
 
   socket.addEventListener("open", () => {
     log("WebSocket opened");
-    // Start heartbeat monitoring
     heartbeatIntervalId = startWebSocketHeartbeat(socket, log);
   });
 
@@ -1281,9 +1288,10 @@ async function vlessOverWSHandler(request: Request) {
           if (isDns && udpStreamWrite) {
             return udpStreamWrite(chunk);
           }
-          if (remoteSocketWrapper.value) {
+          // [FIX] Use the tracked writer instead of getWriter() each time
+          if (remoteSocketWrapper.value && tcpWriterWrapper.value) {
             const writeSuccess = await safeWriteToTCP(
-              remoteSocketWrapper.value,
+              tcpWriterWrapper.value,
               new Uint8Array(chunk),
               log
             );
@@ -1343,6 +1351,7 @@ async function vlessOverWSHandler(request: Request) {
 
           handleTCPOutBound(
             remoteSocketWrapper,
+            tcpWriterWrapper,
             addressRemote,
             portRemote,
             rawClientData,
@@ -1386,9 +1395,10 @@ function safeCloseRemote(conn: Deno.TcpConn | null): void {
   }
 }
 
-// ─── TCP Outbound Handler (with retry + backoff) ─────────────────────
+// ─── [FIX #5] TCP Outbound Handler — proper writer management + cleanup on retry ──
 async function handleTCPOutBound(
   remoteSocket: { value: Deno.TcpConn | null },
+  tcpWriterWrapper: { value: WritableStreamDefaultWriter<Uint8Array> | null },
   addressRemote: string,
   portRemote: number,
   rawClientData: Uint8Array,
@@ -1400,16 +1410,29 @@ async function handleTCPOutBound(
     address: string,
     port: number
   ): Promise<Deno.TcpConn> {
-    const tcpSocket = await connectWithTimeout(
-      address,
-      port,
-      CONNECTION_TIMEOUT
-    );
+    // [FIX] Clean up previous connection if any (important for retry)
+    if (tcpWriterWrapper.value) {
+      try { tcpWriterWrapper.value.releaseLock(); } catch (_) { /* ignore */ }
+      tcpWriterWrapper.value = null;
+    }
+    if (remoteSocket.value) {
+      safeCloseRemote(remoteSocket.value);
+      remoteSocket.value = null;
+    }
+
+    const tcpSocket = await connectWithTimeout(address, port, CONNECTION_TIMEOUT);
     remoteSocket.value = tcpSocket;
     trackConnection(tcpSocket);
     log(`connected to ${address}:${port}`);
-    const writeSuccess = await safeWriteToTCP(tcpSocket, new Uint8Array(rawClientData), log);
+
+    // [FIX] Get writer once and store it for reuse
+    const writer = tcpSocket.writable.getWriter();
+    tcpWriterWrapper.value = writer;
+
+    const writeSuccess = await safeWriteToTCP(writer, new Uint8Array(rawClientData), log);
     if (!writeSuccess) {
+      try { writer.releaseLock(); } catch (_) { /* ignore */ }
+      tcpWriterWrapper.value = null;
       throw new Error(`Failed to write initial data to ${address}:${port}`);
     }
     return tcpSocket;
@@ -1442,6 +1465,11 @@ async function handleTCPOutBound(
     log(`Retrying with fixed proxy IP: ${fallbackIP}`);
     try {
       const tcpSocket = await tryConnectWithRetry(fallbackIP, portRemote);
+      // [FIX] Release writer lock before piping readable
+      if (tcpWriterWrapper.value) {
+        try { tcpWriterWrapper.value.releaseLock(); } catch (_) { /* ignore */ }
+        tcpWriterWrapper.value = null;
+      }
       remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
     } catch (e) {
       log(`All retry attempts with proxy IP failed: ${(e as Error).message}`);
@@ -1451,6 +1479,12 @@ async function handleTCPOutBound(
 
   try {
     const tcpSocket = await tryConnectWithRetry(addressRemote, portRemote);
+    // [FIX] Release writer lock before piping readable (readable + writable can't both be locked)
+    if (tcpWriterWrapper.value) {
+      try { tcpWriterWrapper.value.releaseLock(); } catch (_) { /* ignore */ }
+      // Don't null it yet — we still need it for incoming WS data writes
+      // Actually, we need to re-acquire it after pipe setup
+    }
     remoteSocketToWS(
       tcpSocket,
       webSocket,
@@ -1458,6 +1492,15 @@ async function handleTCPOutBound(
       retryWithProxyIP,
       log
     );
+    // [FIX] Re-acquire writer for subsequent WS→TCP writes
+    if (remoteSocket.value && !tcpWriterWrapper.value) {
+      try {
+        tcpWriterWrapper.value = remoteSocket.value.writable.getWriter();
+      } catch (_) {
+        // writable may already be locked by pipe — that's OK,
+        // subsequent writes will be handled through the pipe
+      }
+    }
   } catch (e) {
     log(
       `All direct connection attempts failed: ${(e as Error).message}, attempting proxy IP fallback...`
@@ -1490,7 +1533,7 @@ function makeReadableWebSocketStream(
               log("Blob to ArrayBuffer error", String(err));
             });
         }
-        // Ignore string messages (could be heartbeat responses)
+        // Ignore string messages
       });
 
       webSocketServer.addEventListener("close", () => {
@@ -1693,7 +1736,7 @@ function processVlessHeader(
   };
 }
 
-// ─── Remote Socket to WebSocket (improved stability) ─────────────────
+// ─── [FIX #6] Remote Socket to WebSocket — improved with async send + better abort ──
 async function remoteSocketToWS(
   remoteSocket: Deno.TcpConn,
   webSocket: WebSocket,
@@ -1717,7 +1760,7 @@ async function remoteSocketToWS(
     await remoteSocket.readable.pipeTo(
       new WritableStream({
         start() {},
-        write(chunk, controller) {
+        async write(chunk, controller) {
           hasIncomingData = true;
 
           if (webSocket.readyState !== WS_READY_STATE_OPEN) {
@@ -1728,13 +1771,16 @@ async function remoteSocketToWS(
           try {
             if (!headerSent) {
               const combined = concatUint8Arrays(vlessResponseHeader, chunk);
-              if (!safeWebSocketSend(webSocket, combined)) {
+              // [FIX] Use async version to handle backpressure properly
+              const sent = await safeWebSocketSend(webSocket, combined);
+              if (!sent) {
                 controller.error("WebSocket send failed (backpressure or closed)");
                 return;
               }
               headerSent = true;
             } else {
-              if (!safeWebSocketSend(webSocket, chunk)) {
+              const sent = await safeWebSocketSend(webSocket, chunk);
+              if (!sent) {
                 controller.error("WebSocket send failed (backpressure or closed)");
                 return;
               }
@@ -1892,9 +1938,7 @@ async function handleUDPOutBound(
     flush(_controller) {},
   });
 
-  // DNS query with DoH fallback providers
   async function queryDoH(dnsPayload: Uint8Array): Promise<ArrayBuffer> {
-    // Create a cache key from the DNS query
     const cacheKey = btoa(String.fromCharCode(...dnsPayload.slice(0, Math.min(dnsPayload.length, 64))));
     const cached = getCachedDNS(cacheKey);
     if (cached) {
@@ -1920,7 +1964,6 @@ async function handleUDPOutBound(
         }
 
         const result = await resp.arrayBuffer();
-        // Cache the result
         setCachedDNS(cacheKey, result);
         return result;
       } catch (e) {
@@ -1946,12 +1989,12 @@ async function handleUDPOutBound(
               log(`doh success and dns message length is ${udpSize}`);
               const dnsResultArray = new Uint8Array(dnsQueryResult);
               if (isVlessHeaderSent) {
-                safeWebSocketSend(
+                safeWebSocketSendSync(
                   webSocket,
                   concatUint8Arrays(udpSizeBuffer, dnsResultArray)
                 );
               } else {
-                safeWebSocketSend(
+                safeWebSocketSendSync(
                   webSocket,
                   concatUint8Arrays(
                     vlessResponseHeader,

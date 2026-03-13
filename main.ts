@@ -14,17 +14,19 @@ const stickyProxyIPEnv = Deno.env.get("STICKY_PROXYIP") || "";
 const subToken = Deno.env.get("SUB_TOKEN") || "";
 const REQUIRE_HTTPS = Deno.env.get("REQUIRE_HTTPS") !== "false";
 const CONFIG_FILE = "config.json";
+const DEBUG = Deno.env.get("DEBUG") === "true";
 
 // ─── Stability Tuning Constants ──────────────────────────────────────
-const TCP_KEEPALIVE_DELAY = 30; // seconds
 const WS_PING_INTERVAL = 25_000; // ms
 const CONNECTION_TIMEOUT = 15_000; // ms
 const MAX_RETRY_ATTEMPTS = 3;
 const RETRY_BASE_DELAY = 1000; // ms
 const DNS_CACHE_TTL = 300_000; // ms
-const WRITE_RETRY_ATTEMPTS = 2;
-const WRITE_RETRY_DELAY = 500; // ms
 const DOH_TIMEOUT = 5000; // ms
+const WS_IDLE_TIMEOUT = 300; // seconds (5 minutes)
+const WS_BACKPRESSURE_HIGH = 8 * 1024 * 1024; // 8MB
+const WS_BACKPRESSURE_CHECK_DELAY = 50; // ms
+const TCP_WRITE_TIMEOUT = 10_000; // ms
 
 interface Config {
   uuid?: string;
@@ -344,6 +346,7 @@ console.log(`WebSocket path: ${wsPath}`);
 console.log(
   `Fixed Proxy IP: ${fixedProxyIP || "(none — direct connection)"}`
 );
+console.log(`Debug mode: ${DEBUG}`);
 
 // ─── Connection Tracking & Graceful Shutdown ─────────────────────────
 const activeConnections = new Set<Deno.TcpConn>();
@@ -375,21 +378,31 @@ function gracefulShutdown(signal: string): void {
   }
   activePingIntervals.clear();
   for (const ws of activeWebSockets) {
-    try { ws.close(1001, "Server shutting down"); } catch (_) {}
+    try {
+      ws.close(1001, "Server shutting down");
+    } catch (_) { /* ignore */ }
   }
   for (const conn of activeConnections) {
-    try { conn.close(); } catch (_) {}
+    try {
+      conn.close();
+    } catch (_) { /* ignore */ }
   }
   Deno.exit(0);
 }
 
-try { Deno.addSignalListener("SIGINT", () => gracefulShutdown("SIGINT")); } catch (_) {}
-try { Deno.addSignalListener("SIGTERM", () => gracefulShutdown("SIGTERM")); } catch (_) {}
+try {
+  Deno.addSignalListener("SIGINT", () => gracefulShutdown("SIGINT"));
+} catch (_) { /* ignore on platforms that don't support it */ }
+try {
+  Deno.addSignalListener("SIGTERM", () => gracefulShutdown("SIGTERM"));
+} catch (_) { /* ignore */ }
 
 // ─── Buffer Concatenation Helper ─────────────────────────────────────
 function concatUint8Arrays(...arrays: Uint8Array[]): Uint8Array {
   let totalLength = 0;
-  for (const arr of arrays) { totalLength += arr.byteLength; }
+  for (const arr of arrays) {
+    totalLength += arr.byteLength;
+  }
   const result = new Uint8Array(totalLength);
   let offset = 0;
   for (const arr of arrays) {
@@ -418,9 +431,14 @@ async function retryWithBackoff<T>(
     } catch (e) {
       lastError = e as Error;
       if (attempt < maxAttempts) {
-        const jitter = Math.random() * 0.3 + 0.85; 
-        const waitTime = Math.min(baseDelay * Math.pow(2, attempt - 1) * jitter, 10000);
-        log(`Attempt ${attempt}/${maxAttempts} failed: ${lastError.message}. Retrying in ${Math.round(waitTime)}ms...`);
+        const jitter = Math.random() * 0.3 + 0.85;
+        const waitTime = Math.min(
+          baseDelay * Math.pow(2, attempt - 1) * jitter,
+          10000
+        );
+        log(
+          `Attempt ${attempt}/${maxAttempts} failed: ${lastError.message}. Retrying in ${Math.round(waitTime)}ms...`
+        );
         await delay(waitTime);
       }
     }
@@ -428,48 +446,46 @@ async function retryWithBackoff<T>(
   throw lastError;
 }
 
-// ─── Safe Write to TCP with Retry ────────────────────────────────────
+// ─── Safe Write to TCP (fixed: no repeated getWriter) ────────────────
 async function safeWriteToTCP(
-  conn: Deno.TcpConn,
+  writer: WritableStreamDefaultWriter<Uint8Array>,
   data: Uint8Array,
   log: (info: string, event?: string) => void
 ): Promise<boolean> {
-  for (let attempt = 1; attempt <= WRITE_RETRY_ATTEMPTS; attempt++) {
-    try {
-      const writer = conn.writable.getWriter();
-      try {
-        await writer.write(data);
-      } finally {
-        writer.releaseLock();
-      }
-      return true;
-    } catch (e) {
-      if (attempt < WRITE_RETRY_ATTEMPTS) {
-        log(`TCP write attempt ${attempt} failed: ${(e as Error).message}, retrying...`);
-        await delay(WRITE_RETRY_DELAY);
-      } else {
-        return false;
-      }
-    }
+  try {
+    await Promise.race([
+      writer.write(data),
+      delay(TCP_WRITE_TIMEOUT).then(() => {
+        throw new Error("TCP write timed out");
+      }),
+    ]);
+    return true;
+  } catch (e) {
+    log(`TCP write failed: ${(e as Error).message}`);
+    return false;
   }
-  return false;
 }
 
 // ─── Safe WebSocket Send with Async Backpressure Handling ─────────────
-// ပြောင်းလဲချက် - Data drop လုပ်ခြင်းကို ဖြုတ်လိုက်ပြီး Buffer ချောင်သွားသည်အထိ စောင့်ပေးရန် ပြင်ဆင်ထားသည်
-async function safeWebSocketSendAsync(ws: WebSocket, data: Uint8Array | ArrayBuffer): Promise<boolean> {
+async function safeWebSocketSendAsync(
+  ws: WebSocket,
+  data: Uint8Array | ArrayBuffer
+): Promise<boolean> {
   try {
     if (ws.readyState !== WS_READY_STATE_OPEN) {
       return false;
     }
-    
-    // Backpressure handling: wait if buffer is too large (e.g. > 8MB)
-    // NEVER drop packets for TCP proxied connections
-    while (ws.bufferedAmount > 8 * 1024 * 1024) {
-      await delay(50); // Wait 50ms and check again
+    // Backpressure handling: wait if buffer is too large
+    let waitCount = 0;
+    while (ws.bufferedAmount > WS_BACKPRESSURE_HIGH) {
+      await delay(WS_BACKPRESSURE_CHECK_DELAY);
+      waitCount++;
       if (ws.readyState !== WS_READY_STATE_OPEN) return false;
+      // Safety valve: if we've been waiting too long (5s), give up
+      if (waitCount > 100) {
+        return false;
+      }
     }
-    
     ws.send(data);
     return true;
   } catch (_) {
@@ -477,7 +493,10 @@ async function safeWebSocketSendAsync(ws: WebSocket, data: Uint8Array | ArrayBuf
   }
 }
 
-function safeWebSocketSend(ws: WebSocket, data: Uint8Array | ArrayBuffer): boolean {
+function safeWebSocketSend(
+  ws: WebSocket,
+  data: Uint8Array | ArrayBuffer
+): boolean {
   try {
     if (ws.readyState !== WS_READY_STATE_OPEN) return false;
     ws.send(data);
@@ -598,6 +617,18 @@ const getHtml = (title: string, bodyContent: string) => `
             font-weight: 600;
             margin-bottom: 10px;
         }
+        .status-box {
+            background: rgba(34, 197, 94, 0.1);
+            border: 1px solid rgba(34, 197, 94, 0.2);
+            border-radius: 12px;
+            padding: 15px;
+            margin-top: 20px;
+        }
+        .status-text {
+            color: #4ade80;
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -628,27 +659,51 @@ async function connectWithTimeout(
   const connPromise = Deno.connect({ hostname, port });
   const timer = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(
-      () => reject(new Error(`Connection to ${hostname}:${port} timed out after ${timeout}ms`)),
+      () =>
+        reject(
+          new Error(
+            `Connection to ${hostname}:${port} timed out after ${timeout}ms`
+          )
+        ),
       timeout
     );
   });
   try {
     const conn = await Promise.race([connPromise, timer]);
     clearTimeout(timeoutId!);
-    try { conn.setKeepAlive(true); } catch (_) {}
-    try { conn.setNoDelay(true); } catch (_) {}
+    try {
+      conn.setKeepAlive(true);
+    } catch (_) { /* ignore */ }
+    try {
+      conn.setNoDelay(true);
+    } catch (_) { /* ignore */ }
     return conn;
   } catch (e) {
     clearTimeout(timeoutId!);
-    connPromise.then((c) => { try { c.close(); } catch (_) {} }).catch(() => {});
+    connPromise
+      .then((c) => {
+        try {
+          c.close();
+        } catch (_) { /* ignore */ }
+      })
+      .catch(() => {});
     throw e;
   }
 }
 
 function isValidAddress(address: string): boolean {
   const privateRanges = [
-    /^127\./, /^10\./, /^172\.(1[6-9]|2[0-9]|3[01])\./, /^192\.168\./,
-    /^0\./, /^169\.254\./, /^::1$/, /^fc00:/i, /^fd00:/i, /^fe80:/i, /^localhost$/i,
+    /^127\./,
+    /^10\./,
+    /^172\.(1[6-9]|2[0-9]|3[01])\./,
+    /^192\.168\./,
+    /^0\./,
+    /^169\.254\./,
+    /^::1$/,
+    /^fc00:/i,
+    /^fd00:/i,
+    /^fe80:/i,
+    /^localhost$/i,
   ];
   for (const regex of privateRanges) {
     if (regex.test(address)) return false;
@@ -666,9 +721,10 @@ function startWebSocketHeartbeat(
       activePingIntervals.delete(intervalId);
       return;
     }
-    // Only logging instead of punishing for bufferedAmount
     if (ws.bufferedAmount > 5 * 1024 * 1024) {
-      log(`WebSocket heartbeat: high buffered amount (${ws.bufferedAmount}), possible slow network`);
+      log(
+        `WebSocket heartbeat: high buffered amount (${ws.bufferedAmount}), possible slow network`
+      );
     }
   }, WS_PING_INTERVAL);
   activePingIntervals.add(intervalId);
@@ -681,11 +737,15 @@ Deno.serve(async (request: Request) => {
 
   const upgrade = request.headers.get("upgrade") || "";
   if (upgrade.toLowerCase() === "websocket") {
-    if (url.pathname !== wsPath) return new Response("Not Found", { status: 404 });
+    if (url.pathname !== wsPath)
+      return new Response("Not Found", { status: 404 });
     return await vlessOverWSHandler(request);
   }
 
-  if (REQUIRE_HTTPS && (url.pathname === "/config" || url.pathname === "/sub")) {
+  if (
+    REQUIRE_HTTPS &&
+    (url.pathname === "/config" || url.pathname === "/sub")
+  ) {
     const httpsRedirect = requireHTTPS(request);
     if (httpsRedirect) return httpsRedirect;
   }
@@ -697,7 +757,11 @@ Deno.serve(async (request: Request) => {
           status: "ok",
           activeConnections: activeConnections.size,
           activeWebSockets: activeWebSockets.size,
-        }, null, 2
+          dnsCacheSize: dnsCache.size,
+          uptime: Math.floor(performance.now() / 1000),
+        },
+        null,
+        2
       ),
       { status: 200, headers: { "Content-Type": "application/json" } }
     );
@@ -711,9 +775,12 @@ Deno.serve(async (request: Request) => {
     const port = url.port || (url.protocol === "https:" ? 443 : 80);
     const allLinks = userIDs
       .map((uid, index) => {
-        const tag = credit ? `${credit}-${index + 1}` : `${hostName}-${index + 1}`;
+        const tag = credit
+          ? `${credit}-${index + 1}`
+          : `${hostName}-${index + 1}`;
         return `vless://${uid}@${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=${encodeURIComponent(wsPath + "?ed=2048")}#${tag}`;
-      }).join("\n");
+      })
+      .join("\n");
     return secureResponse(btoa(allLinks), {
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
@@ -728,7 +795,9 @@ Deno.serve(async (request: Request) => {
     let userSections = "";
 
     userIDs.forEach((uid, index) => {
-      const rawTag = credit ? `${credit}-${index + 1}` : `${hostName}-${index + 1}`;
+      const rawTag = credit
+        ? `${credit}-${index + 1}`
+        : `${hostName}-${index + 1}`;
       const vlessLink = `vless://${uid}@${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=${encodeURIComponent(wsPath + "?ed=2048")}#${rawTag}`;
       userSections += `
         <div class="user-section">
@@ -743,7 +812,11 @@ Deno.serve(async (request: Request) => {
         </div>`;
     });
 
-    const content = `<h1>Server Configuration</h1>${userSections}`;
+    const content = `<h1>Server Configuration</h1>
+    <div class="status-box">
+        <span class="status-text">Active Connections: ${activeConnections.size} | WebSockets: ${activeWebSockets.size}</span>
+    </div>
+    ${userSections}`;
     return secureResponse(getHtml("VLESS Config", content), {
       status: 200,
       headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -751,36 +824,67 @@ Deno.serve(async (request: Request) => {
   }
 
   if (url.pathname === "/") {
-    return secureResponse(getHtml("NovaByte Cloud", "<h1>NovaByte Cloud</h1><p>Running Smoothly</p>"), {
-      headers: { "Content-Type": "text/html; charset=utf-8" },
-    });
+    return secureResponse(
+      getHtml(
+        "NovaByte Cloud",
+        "<h1>NovaByte Cloud</h1><p>Running Smoothly</p>"
+      ),
+      {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      }
+    );
   }
 
   return secureResponse(getHtml("404", "<h1>404 Not Found</h1>"), {
-    status: 404, headers: { "Content-Type": "text/html; charset=utf-8" },
+    status: 404,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
   });
 });
 
 // ─── VLESS over WebSocket Handler ────────────────────────────────────
 async function vlessOverWSHandler(request: Request) {
-  // idleTimeout ကို ဖြုတ်လိုက်ပြီး တည်ငြိမ်မှုပိုရှိစေရန်
-  const { socket, response } = Deno.upgradeWebSocket(request);
+  const { socket, response } = Deno.upgradeWebSocket(request, {
+    idleTimeout: WS_IDLE_TIMEOUT,
+  });
   let address = "";
   let portWithRandomLog = "";
   let heartbeatIntervalId: number | undefined;
-  const log = (info: string, event = "") => { }; // console.log(`[${address}:${portWithRandomLog}] ${info}`, event);
+  let cleanedUp = false;
 
-  const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-  const readableWebSocketStream = makeReadableWebSocketStream(socket, earlyDataHeader, log);
-  const remoteSocketWrapper: { value: Deno.TcpConn | null } = { value: null };
+  const log = (info: string, event = "") => {
+    if (DEBUG) {
+      console.log(`[${address}:${portWithRandomLog}] ${info}`, event);
+    }
+  };
+
+  const earlyDataHeader =
+    request.headers.get("sec-websocket-protocol") || "";
+  const readableWebSocketStream = makeReadableWebSocketStream(
+    socket,
+    earlyDataHeader,
+    log
+  );
+  const remoteSocketWrapper: { value: Deno.TcpConn | null } = {
+    value: null,
+  };
+  // Keep a single TCP writer to avoid repeated getWriter() calls
+  let tcpWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   let udpStreamWrite: ((chunk: Uint8Array) => void) | null = null;
   let isDns = false;
 
   const cleanupAll = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
     if (heartbeatIntervalId !== undefined) {
       clearInterval(heartbeatIntervalId);
       activePingIntervals.delete(heartbeatIntervalId);
       heartbeatIntervalId = undefined;
+    }
+    if (tcpWriter) {
+      try {
+        tcpWriter.releaseLock();
+      } catch (_) { /* ignore */ }
+      tcpWriter = null;
     }
     safeCloseRemote(remoteSocketWrapper.value);
     remoteSocketWrapper.value = null;
@@ -790,48 +894,97 @@ async function vlessOverWSHandler(request: Request) {
   trackWebSocket(socket);
 
   socket.addEventListener("open", () => {
+    log("WebSocket opened");
     heartbeatIntervalId = startWebSocketHeartbeat(socket, log);
   });
-  socket.addEventListener("close", cleanupAll);
-  socket.addEventListener("error", cleanupAll);
-
-  readableWebSocketStream.pipeTo(
-    new WritableStream({
-      async write(chunk, controller) {
-        if (isDns && udpStreamWrite) return udpStreamWrite(chunk);
-        if (remoteSocketWrapper.value) {
-          const writeSuccess = await safeWriteToTCP(remoteSocketWrapper.value, new Uint8Array(chunk), log);
-          if (!writeSuccess) controller.error("TCP write failed");
-          return;
-        }
-
-        const { hasError, message, portRemote = 443, addressRemote = "", rawDataIndex, vlessVersion = new Uint8Array([0, 0]), isUDP } = processVlessHeader(chunk, userIDs);
-        address = addressRemote;
-        portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? "udp " : "tcp "} `;
-
-        if (hasError) throw new Error(message);
-        if (!isValidAddress(addressRemote)) throw new Error(`Private address blocked`);
-        if (isUDP && portRemote === 53) isDns = true;
-
-        const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
-        const rawClientData = chunk.slice(rawDataIndex!);
-
-        if (isDns) {
-          const { write } = await handleUDPOutBound(socket, vlessResponseHeader, log);
-          udpStreamWrite = write;
-          udpStreamWrite(rawClientData);
-          return;
-        }
-
-        handleTCPOutBound(remoteSocketWrapper, addressRemote, portRemote, rawClientData, socket, vlessResponseHeader, log);
-      },
-      close() { cleanupAll(); },
-      abort() { cleanupAll(); },
-    })
-  ).catch((err) => {
+  socket.addEventListener("close", () => {
+    log("WebSocket closed");
     cleanupAll();
-    safeCloseWebSocket(socket);
   });
+  socket.addEventListener("error", (e) => {
+    log(`WebSocket error: ${e}`);
+    cleanupAll();
+  });
+
+  readableWebSocketStream
+    .pipeTo(
+      new WritableStream({
+        async write(chunk, controller) {
+          if (isDns && udpStreamWrite) return udpStreamWrite(chunk);
+          if (remoteSocketWrapper.value && tcpWriter) {
+            const writeSuccess = await safeWriteToTCP(
+              tcpWriter,
+              new Uint8Array(chunk),
+              log
+            );
+            if (!writeSuccess) {
+              controller.error("TCP write failed");
+            }
+            return;
+          }
+
+          const {
+            hasError,
+            message,
+            portRemote = 443,
+            addressRemote = "",
+            rawDataIndex,
+            vlessVersion = new Uint8Array([0, 0]),
+            isUDP,
+          } = processVlessHeader(chunk, userIDs);
+          address = addressRemote;
+          portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? "udp " : "tcp "} `;
+
+          if (hasError) throw new Error(message);
+          if (!isValidAddress(addressRemote))
+            throw new Error(`Private address blocked: ${addressRemote}`);
+          if (isUDP && portRemote === 53) isDns = true;
+
+          const vlessResponseHeader = new Uint8Array([
+            vlessVersion[0],
+            0,
+          ]);
+          const rawClientData = chunk.slice(rawDataIndex!);
+
+          if (isDns) {
+            const { write } = await handleUDPOutBound(
+              socket,
+              vlessResponseHeader,
+              log
+            );
+            udpStreamWrite = write;
+            udpStreamWrite(rawClientData);
+            return;
+          }
+
+          await handleTCPOutBound(
+            remoteSocketWrapper,
+            (writer) => {
+              tcpWriter = writer;
+            },
+            addressRemote,
+            portRemote,
+            rawClientData,
+            socket,
+            vlessResponseHeader,
+            log
+          );
+        },
+        close() {
+          log("ReadableStream closed");
+          cleanupAll();
+        },
+        abort(_reason) {
+          log(`ReadableStream aborted`);
+          cleanupAll();
+        },
+      })
+    )
+    .catch((_err) => {
+      log(`pipeTo error: ${(_err as Error)?.message}`);
+      cleanupAll();
+      safeCloseWebSocket(socket);
+    });
 
   return response;
 }
@@ -839,106 +992,242 @@ async function vlessOverWSHandler(request: Request) {
 function safeCloseRemote(conn: Deno.TcpConn | null): void {
   if (conn) {
     untrackConnection(conn);
-    try { conn.close(); } catch (_) {}
+    try {
+      conn.close();
+    } catch (_) { /* ignore */ }
   }
 }
 
 async function handleTCPOutBound(
   remoteSocket: { value: Deno.TcpConn | null },
-  addressRemote: string, portRemote: number, rawClientData: Uint8Array,
-  webSocket: WebSocket, vlessResponseHeader: Uint8Array,
+  setTcpWriter: (writer: WritableStreamDefaultWriter<Uint8Array>) => void,
+  addressRemote: string,
+  portRemote: number,
+  rawClientData: Uint8Array,
+  webSocket: WebSocket,
+  vlessResponseHeader: Uint8Array,
   log: (info: string, event?: string) => void
 ) {
-  async function connectAndWrite(address: string, port: number): Promise<Deno.TcpConn> {
-    const tcpSocket = await connectWithTimeout(address, port, CONNECTION_TIMEOUT);
+  async function connectAndWrite(
+    address: string,
+    port: number
+  ): Promise<Deno.TcpConn> {
+    log(`Connecting to ${address}:${port}`);
+    const tcpSocket = await connectWithTimeout(
+      address,
+      port,
+      CONNECTION_TIMEOUT
+    );
     remoteSocket.value = tcpSocket;
     trackConnection(tcpSocket);
-    const writeSuccess = await safeWriteToTCP(tcpSocket, new Uint8Array(rawClientData), log);
-    if (!writeSuccess) throw new Error(`Write failed`);
+
+    const writer = tcpSocket.writable.getWriter();
+    setTcpWriter(writer);
+
+    const writeSuccess = await safeWriteToTCP(
+      writer,
+      new Uint8Array(rawClientData),
+      log
+    );
+    if (!writeSuccess) {
+      writer.releaseLock();
+      throw new Error(`Initial write failed to ${address}:${port}`);
+    }
     return tcpSocket;
   }
 
+  async function tryDirect(): Promise<Deno.TcpConn> {
+    return await retryWithBackoff(
+      () => connectAndWrite(addressRemote, portRemote),
+      MAX_RETRY_ATTEMPTS,
+      RETRY_BASE_DELAY,
+      log
+    );
+  }
+
+  async function tryProxy(): Promise<Deno.TcpConn> {
+    const proxyIP = getFixedProxyIP();
+    if (!proxyIP) throw new Error("No proxy IP available");
+    log(`Falling back to proxy IP: ${proxyIP}`);
+    // Parse proxy IP which may include port like "1.2.3.4:443"
+    let proxyHost = proxyIP;
+    let proxyPort = portRemote;
+    if (proxyIP.includes(":")) {
+      const parts = proxyIP.split(":");
+      const maybePort = parseInt(parts[parts.length - 1]);
+      if (!isNaN(maybePort)) {
+        proxyHost = parts.slice(0, -1).join(":");
+        proxyPort = maybePort;
+      }
+    }
+    return await retryWithBackoff(
+      () => connectAndWrite(proxyHost, proxyPort),
+      2,
+      RETRY_BASE_DELAY,
+      log
+    );
+  }
+
   try {
-    const tcpSocket = await retryWithBackoff(() => connectAndWrite(addressRemote, portRemote), MAX_RETRY_ATTEMPTS, RETRY_BASE_DELAY, log);
-    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
-  } catch (e) {
-    safeCloseWebSocket(webSocket);
+    const tcpSocket = await tryDirect();
+    log(`Direct connection established to ${addressRemote}:${portRemote}`);
+    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, log);
+  } catch (directErr) {
+    log(
+      `Direct connection failed: ${(directErr as Error).message}`
+    );
+    // Try proxy fallback if available
+    if (getFixedProxyIP()) {
+      try {
+        const tcpSocket = await tryProxy();
+        log(`Proxy connection established via ${getFixedProxyIP()}`);
+        remoteSocketToWS(
+          tcpSocket,
+          webSocket,
+          vlessResponseHeader,
+          log
+        );
+      } catch (proxyErr) {
+        log(
+          `Proxy connection also failed: ${(proxyErr as Error).message}`
+        );
+        safeCloseWebSocket(webSocket);
+      }
+    } else {
+      safeCloseWebSocket(webSocket);
+    }
   }
 }
 
-function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader: string, log: (info: string) => void) {
+function makeReadableWebSocketStream(
+  webSocketServer: WebSocket,
+  earlyDataHeader: string,
+  log: (info: string) => void
+) {
   let readableStreamCancel = false;
   return new ReadableStream({
     start(controller) {
       webSocketServer.addEventListener("message", (event) => {
         if (readableStreamCancel) return;
         const data = event.data;
-        if (data instanceof ArrayBuffer) { controller.enqueue(data); }
-        else if (data instanceof Blob) {
-          data.arrayBuffer().then((buf) => { if (!readableStreamCancel) controller.enqueue(buf); });
+        if (data instanceof ArrayBuffer) {
+          controller.enqueue(data);
+        } else if (data instanceof Blob) {
+          data.arrayBuffer().then((buf) => {
+            if (!readableStreamCancel) controller.enqueue(buf);
+          });
         }
       });
       webSocketServer.addEventListener("close", () => {
         if (readableStreamCancel) return;
-        try { controller.close(); } catch (_) {}
+        try {
+          controller.close();
+        } catch (_) { /* ignore */ }
       });
       webSocketServer.addEventListener("error", (err) => {
-        try { controller.error(err); } catch (_) {}
+        log(`WebSocket stream error`);
+        try {
+          controller.error(err);
+        } catch (_) { /* ignore */ }
       });
       const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-      if (error) controller.error(error);
-      else if (earlyData) controller.enqueue(earlyData);
+      if (error) {
+        log(`Early data decode error: ${error}`);
+        controller.error(error);
+      } else if (earlyData) {
+        controller.enqueue(earlyData);
+      }
     },
-    cancel(reason) {
+    cancel(_reason) {
+      log(`ReadableStream cancelled`);
       readableStreamCancel = true;
       safeCloseWebSocket(webSocketServer);
     },
   });
 }
 
-function processVlessHeader(vlessBuffer: ArrayBuffer, validUserIDs: string[]) {
-  if (vlessBuffer.byteLength < 24) return { hasError: true, message: "invalid data" };
+function processVlessHeader(
+  vlessBuffer: ArrayBuffer,
+  validUserIDs: string[]
+) {
+  if (vlessBuffer.byteLength < 24)
+    return { hasError: true, message: "invalid data" };
   const version = new Uint8Array(vlessBuffer.slice(0, 1));
-  const incomingUUID = stringify(new Uint8Array(vlessBuffer.slice(1, 17))).toLowerCase();
+  const incomingUUID = stringify(
+    new Uint8Array(vlessBuffer.slice(1, 17))
+  ).toLowerCase();
 
   let isValidUser = false;
-  for (const id of validUserIDs) { if (constantTimeEqual(id, incomingUUID)) isValidUser = true; }
+  for (const id of validUserIDs) {
+    if (constantTimeEqual(id, incomingUUID)) isValidUser = true;
+  }
   if (!isValidUser) return { hasError: true, message: "invalid user" };
 
   const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
-  const command = new Uint8Array(vlessBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
-  let isUDP = command === 2;
+  const command = new Uint8Array(
+    vlessBuffer.slice(18 + optLength, 18 + optLength + 1)
+  )[0];
+  const isUDP = command === 2;
   const portIndex = 18 + optLength + 1;
-  const portRemote = new DataView(vlessBuffer.slice(portIndex, portIndex + 2)).getUint16(0);
+  const portRemote = new DataView(
+    vlessBuffer.slice(portIndex, portIndex + 2)
+  ).getUint16(0);
   const addressIndex = portIndex + 2;
-  const addressType = new Uint8Array(vlessBuffer.slice(addressIndex, addressIndex + 1))[0];
-  let addressLength = 0, addressValueIndex = addressIndex + 1, addressValue = "";
+  const addressType = new Uint8Array(
+    vlessBuffer.slice(addressIndex, addressIndex + 1)
+  )[0];
+  let addressLength = 0,
+    addressValueIndex = addressIndex + 1,
+    addressValue = "";
 
   if (addressType === 1) {
     addressLength = 4;
-    addressValue = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
+    addressValue = new Uint8Array(
+      vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+    ).join(".");
   } else if (addressType === 2) {
-    addressLength = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
+    addressLength = new Uint8Array(
+      vlessBuffer.slice(addressValueIndex, addressValueIndex + 1)
+    )[0];
     addressValueIndex += 1;
-    addressValue = new TextDecoder().decode(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
+    addressValue = new TextDecoder().decode(
+      vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+    );
   } else if (addressType === 3) {
     addressLength = 16;
-    const dataView = new DataView(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
+    const dataView = new DataView(
+      vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)
+    );
     const ipv6: string[] = [];
-    for (let i = 0; i < 8; i++) ipv6.push(dataView.getUint16(i * 2).toString(16));
+    for (let i = 0; i < 8; i++)
+      ipv6.push(dataView.getUint16(i * 2).toString(16));
     addressValue = ipv6.join(":");
   }
-  return { hasError: false, addressRemote: addressValue, addressType, portRemote, rawDataIndex: addressValueIndex + addressLength, vlessVersion: version, isUDP };
+  return {
+    hasError: false,
+    addressRemote: addressValue,
+    addressType,
+    portRemote,
+    rawDataIndex: addressValueIndex + addressLength,
+    vlessVersion: version,
+    isUDP,
+  };
 }
 
 // ─── Remote Socket to WebSocket ──────────────────────────────────────
 async function remoteSocketToWS(
-  remoteSocket: Deno.TcpConn, webSocket: WebSocket, vlessResponseHeader: Uint8Array,
-  retry: (() => Promise<void>) | null, log: (info: string) => void
+  remoteSocket: Deno.TcpConn,
+  webSocket: WebSocket,
+  vlessResponseHeader: Uint8Array,
+  log: (info: string) => void
 ) {
   let headerSent = false;
   const abortController = new AbortController();
-  const onWsClose = () => abortController.abort();
+  const onWsClose = () => {
+    try {
+      abortController.abort();
+    } catch (_) { /* ignore */ }
+  };
   webSocket.addEventListener("close", onWsClose);
   webSocket.addEventListener("error", onWsClose);
 
@@ -950,25 +1239,48 @@ async function remoteSocketToWS(
             controller.error("webSocket is closed");
             return;
           }
-          // Here we use the updated async backpressure send function
           if (!headerSent) {
-            const combined = concatUint8Arrays(vlessResponseHeader, chunk);
-            const success = await safeWebSocketSendAsync(webSocket, combined);
-            if (!success) { controller.error("WS send failed"); return; }
+            const combined = concatUint8Arrays(
+              vlessResponseHeader,
+              chunk
+            );
+            const success = await safeWebSocketSendAsync(
+              webSocket,
+              combined
+            );
+            if (!success) {
+              controller.error("WS send failed (header)");
+              return;
+            }
             headerSent = true;
           } else {
-            const success = await safeWebSocketSendAsync(webSocket, chunk);
-            if (!success) { controller.error("WS send failed"); return; }
+            const success = await safeWebSocketSendAsync(
+              webSocket,
+              chunk
+            );
+            if (!success) {
+              controller.error("WS send failed");
+              return;
+            }
           }
-        }
+        },
       }),
       { signal: abortController.signal }
     );
   } catch (error) {
-    safeCloseRemote(remoteSocket);
-    safeCloseWebSocket(webSocket);
+    const msg = (error as Error)?.message || "";
+    // Don't log abort signals as errors
+    if (!msg.includes("abort")) {
+      log(`remoteSocketToWS error: ${msg}`);
+    }
   } finally {
-    try { webSocket.removeEventListener("close", onWsClose); } catch (_) {}
+    try {
+      webSocket.removeEventListener("close", onWsClose);
+    } catch (_) { /* ignore */ }
+    try {
+      webSocket.removeEventListener("error", onWsClose);
+    } catch (_) { /* ignore */ }
+    safeCloseRemote(remoteSocket);
   }
 }
 
@@ -976,8 +1288,15 @@ function base64ToArrayBuffer(base64Str: string) {
   if (!base64Str) return { error: null };
   try {
     base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
-    return { earlyData: Uint8Array.from(atob(base64Str), (c) => c.charCodeAt(0)).buffer, error: null };
-  } catch (error) { return { error: error }; }
+    return {
+      earlyData: Uint8Array.from(atob(base64Str), (c) =>
+        c.charCodeAt(0)
+      ).buffer,
+      error: null,
+    };
+  } catch (error) {
+    return { error: error };
+  }
 }
 
 const WS_READY_STATE_OPEN = 1;
@@ -985,36 +1304,79 @@ const WS_READY_STATE_CLOSING = 2;
 
 function safeCloseWebSocket(socket: WebSocket) {
   try {
-    if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
+    if (
+      socket.readyState === WS_READY_STATE_OPEN ||
+      socket.readyState === WS_READY_STATE_CLOSING
+    ) {
       socket.close();
     }
-  } catch (error) {}
+  } catch (_) { /* ignore */ }
 }
 
 const byteToHex: string[] = [];
-for (let i = 0; i < 256; ++i) byteToHex.push((i + 256).toString(16).slice(1));
+for (let i = 0; i < 256; ++i)
+  byteToHex.push((i + 256).toString(16).slice(1));
 
 function unsafeStringify(arr: Uint8Array, offset = 0) {
-  return (byteToHex[arr[offset + 0]] + byteToHex[arr[offset + 1]] + byteToHex[arr[offset + 2]] + byteToHex[arr[offset + 3]] + "-" + byteToHex[arr[offset + 4]] + byteToHex[arr[offset + 5]] + "-" + byteToHex[arr[offset + 6]] + byteToHex[arr[offset + 7]] + "-" + byteToHex[arr[offset + 8]] + byteToHex[arr[offset + 9]] + "-" + byteToHex[arr[offset + 10]] + byteToHex[arr[offset + 11]] + byteToHex[arr[offset + 12]] + byteToHex[arr[offset + 13]] + byteToHex[arr[offset + 14]] + byteToHex[arr[offset + 15]]).toLowerCase();
+  return (
+    byteToHex[arr[offset + 0]] +
+    byteToHex[arr[offset + 1]] +
+    byteToHex[arr[offset + 2]] +
+    byteToHex[arr[offset + 3]] +
+    "-" +
+    byteToHex[arr[offset + 4]] +
+    byteToHex[arr[offset + 5]] +
+    "-" +
+    byteToHex[arr[offset + 6]] +
+    byteToHex[arr[offset + 7]] +
+    "-" +
+    byteToHex[arr[offset + 8]] +
+    byteToHex[arr[offset + 9]] +
+    "-" +
+    byteToHex[arr[offset + 10]] +
+    byteToHex[arr[offset + 11]] +
+    byteToHex[arr[offset + 12]] +
+    byteToHex[arr[offset + 13]] +
+    byteToHex[arr[offset + 14]] +
+    byteToHex[arr[offset + 15]]
+  ).toLowerCase();
 }
-function stringify(arr: Uint8Array, offset = 0) { return unsafeStringify(arr, offset); }
+function stringify(arr: Uint8Array, offset = 0) {
+  return unsafeStringify(arr, offset);
+}
 
-async function handleUDPOutBound(webSocket: WebSocket, vlessResponseHeader: Uint8Array, log: (info: string) => void) {
+async function handleUDPOutBound(
+  webSocket: WebSocket,
+  vlessResponseHeader: Uint8Array,
+  log: (info: string) => void
+) {
   let isVlessHeaderSent = false;
   const transformStream = new TransformStream({
     transform(chunk, controller) {
       for (let index = 0; index < chunk.byteLength; ) {
         if (index + 2 > chunk.byteLength) break;
-        const udpPacketLength = new DataView(chunk.slice(index, index + 2)).getUint16(0);
-        if (udpPacketLength === 0 || index + 2 + udpPacketLength > chunk.byteLength) break;
-        controller.enqueue(new Uint8Array(chunk.slice(index + 2, index + 2 + udpPacketLength)));
+        const udpPacketLength = new DataView(
+          chunk.slice(index, index + 2)
+        ).getUint16(0);
+        if (
+          udpPacketLength === 0 ||
+          index + 2 + udpPacketLength > chunk.byteLength
+        )
+          break;
+        controller.enqueue(
+          new Uint8Array(chunk.slice(index + 2, index + 2 + udpPacketLength))
+        );
         index = index + 2 + udpPacketLength;
       }
-    }
+    },
   });
 
   async function queryDoH(dnsPayload: Uint8Array): Promise<ArrayBuffer> {
-    const cacheKey = btoa(String.fromCharCode(...dnsPayload.slice(0, Math.min(dnsPayload.length, 64))));
+    const cacheKey = btoa(
+      String.fromCharCode(
+        ...dnsPayload.slice(0, Math.min(dnsPayload.length, 64))
+      )
+    );
     const cached = getCachedDNS(cacheKey);
     if (cached) return cached;
     let lastError: Error | undefined;
@@ -1022,37 +1384,68 @@ async function handleUDPOutBound(webSocket: WebSocket, vlessResponseHeader: Uint
       try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), DOH_TIMEOUT);
-        const resp = await fetch(provider, { method: "POST", headers: { "content-type": "application/dns-message" }, body: dnsPayload, signal: controller.signal });
+        const resp = await fetch(provider, {
+          method: "POST",
+          headers: { "content-type": "application/dns-message" },
+          body: dnsPayload,
+          signal: controller.signal,
+        });
         clearTimeout(timeoutId);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const result = await resp.arrayBuffer();
         setCachedDNS(cacheKey, result);
         return result;
-      } catch (e) { lastError = e as Error; }
+      } catch (e) {
+        lastError = e as Error;
+      }
     }
     throw lastError || new Error("DoH failed");
   }
 
-  transformStream.readable.pipeTo(
-    new WritableStream({
-      async write(chunk) {
-        try {
-          const dnsQueryResult = await queryDoH(chunk);
-          const udpSize = dnsQueryResult.byteLength;
-          const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
-          if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            const dnsResultArray = new Uint8Array(dnsQueryResult);
-            if (isVlessHeaderSent) {
-              safeWebSocketSend(webSocket, concatUint8Arrays(udpSizeBuffer, dnsResultArray));
-            } else {
-              safeWebSocketSend(webSocket, concatUint8Arrays(vlessResponseHeader, udpSizeBuffer, dnsResultArray));
-              isVlessHeaderSent = true;
+  transformStream.readable
+    .pipeTo(
+      new WritableStream({
+        async write(chunk) {
+          try {
+            const dnsQueryResult = await queryDoH(chunk);
+            const udpSize = dnsQueryResult.byteLength;
+            const udpSizeBuffer = new Uint8Array([
+              (udpSize >> 8) & 0xff,
+              udpSize & 0xff,
+            ]);
+            if (webSocket.readyState === WS_READY_STATE_OPEN) {
+              const dnsResultArray = new Uint8Array(dnsQueryResult);
+              if (isVlessHeaderSent) {
+                safeWebSocketSend(
+                  webSocket,
+                  concatUint8Arrays(udpSizeBuffer, dnsResultArray)
+                );
+              } else {
+                safeWebSocketSend(
+                  webSocket,
+                  concatUint8Arrays(
+                    vlessResponseHeader,
+                    udpSizeBuffer,
+                    dnsResultArray
+                  )
+                );
+                isVlessHeaderSent = true;
+              }
             }
+          } catch (e) {
+            log(`DoH query failed: ${(e as Error).message}`);
           }
-        } catch (e) {}
-      }
-    })
-  ).catch(() => {});
+        },
+      })
+    )
+    .catch((e) => {
+      log(`UDP transform pipe error: ${(e as Error)?.message}`);
+    });
+
   const writer = transformStream.writable.getWriter();
-  return { write(chunk: Uint8Array) { writer.write(chunk); } };
+  return {
+    write(chunk: Uint8Array) {
+      writer.write(chunk);
+    },
+  };
 }
